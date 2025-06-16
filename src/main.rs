@@ -1,147 +1,171 @@
-use std::{fs, io::Write, path::Path, process::exit};
-
 use clap::Parser;
+use dirs::home_dir;
 use powershell_script::PsScriptBuilder;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use shellexpand;
+use std::{
+    fs,
+    io::{self},
+    path::PathBuf,
+    process::exit,
+};
 
+/// CLI arguments: --out, --field, --vm are optional when not setting defaults
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Name of the JSON file to input the VM IP address
+    /// JSON file to update with the VM IP
     #[arg(short, long)]
-    out: String,
+    out: Option<String>,
 
+    /// JSON field name for the IP address
     #[arg(short, long)]
-    field: String,
+    field: Option<String>,
 
+    /// Name of the Hyper-V VM to query
     #[arg(short, long)]
-    vm: String,
+    vm: Option<String>,
 
+    /// Store these args as defaults in ~/.hyperip/settings.json
     #[arg(short, long)]
     set_default: bool,
 }
 
-#[derive(Deserialize, Debug)]
+/// Stored default configuration
+#[derive(Serialize, Deserialize, Debug)]
 struct Config {
-    pub vm: String,
-    pub out: String,
-    pub field: String,
+    out: String,
+    field: String,
+    vm: String,
 }
 
-fn main() {
-    let mut args = Args::parse();
+/// Expand a potentially-tilde path into a full PathBuf
+fn expand_path(input: &str) -> PathBuf {
+    PathBuf::from(shellexpand::tilde(input).into_owned())
+}
 
-    let mut default = false;
+/// Load defaults from the config file
+fn load_config(path: &PathBuf) -> Config {
+    let raw = fs::read_to_string(path).expect("Failed to read default config");
+    serde_json::from_str(&raw).expect("Default config is invalid JSON")
+}
 
-    if args.set_default {
-        default = true;
-    }
+/// Save defaults to the config file (pretty-printed)
+fn save_config(path: &PathBuf, cfg: &Config) {
+    let data = serde_json::to_string_pretty(cfg).expect("Failed to serialize default config");
+    fs::write(path, data).expect("Failed to write default config file");
+}
 
-    let dir = Path::new("~/.hyperip");
-    let file = Path::new("~/.hyperip/settings.json");
+/// Query the VM's IP via PowerShell
+fn query_vm_ip(vm_name: &str) -> String {
+    let ps = PsScriptBuilder::new()
+        .no_profile(true)
+        .non_interactive(true)
+        .hidden(true)
+        .print_commands(false)
+        .build();
 
-    if default {
-        if args.out.is_empty() || args.field.is_empty() || args.vm.is_empty() {
-            eprintln!("Missing fields.");
-            exit(1);
-        }
+    let script = format!(
+        "(Get-VM -Name '{vm}').NetworkAdapters.IPAddresses[0]",
+        vm = vm_name
+    );
+    let output = ps.run(&script).expect("PowerShell query failed");
+    output.stdout().unwrap_or_default().trim().to_string()
+}
 
-        if !dir.exists() {
-            fs::create_dir_all(dir).expect("Failed to create settings directory.");
-        }
+/// Read, update a field in, and write back a JSON object
+fn update_json(path: &PathBuf, key: &str, value: Value) {
+    let raw = fs::read_to_string(path).expect("Failed to read target JSON file");
+    let mut data: Value = serde_json::from_str(&raw).expect("Target JSON is invalid");
 
-        if !file.exists() {
-            let mut f = fs::File::create(file).unwrap();
-            let default = json!({"out": args.out, "field": args.field, "vm": args.vm});
-            f.write_all(default.to_string().as_bytes())
-                .expect("Failed to write settings file.");
-        }
-
-        let ps = PsScriptBuilder::new()
-            .no_profile(true)
-            .non_interactive(true)
-            .hidden(true)
-            .print_commands(false)
-            .build();
-
-        let script = "(Get-VM -Name 'MACHINE_NAME').NetworkAdapters.IPAddresses[0]";
-
-        let output = ps.run(script).expect("Failed to run script");
-
-        let file = fs::read_to_string(&args.out).expect("File was unable to be read.");
-
-        let mut data: Value = serde_json::from_str(&file).expect("Unable to read JSON");
-
-        let new_val = json!(output.stdout().unwrap().trim());
-
-        match data {
-            Value::Object(ref mut map) => {
-                map.insert(args.field, new_val);
-            }
-            _ => {
-                eprintln!("Failed to match data to type. Unable to update field");
-                exit(1)
-            }
-        }
-
-        fs::write(
-            &args.out,
-            serde_json::to_string_pretty(&data).expect("Failed to serialize JSON"),
-        )
-        .expect("Failed to write to file");
+    if let Value::Object(ref mut map) = data {
+        map.insert(key.to_string(), value);
+        let out = serde_json::to_string_pretty(&data).expect("Failed to serialize updated JSON");
+        fs::write(path, out).expect("Failed to write updated JSON");
     } else {
-        if args.out.is_empty() || args.field.is_empty() || args.vm.is_empty() {
-            if dir.exists() && file.exists() {
-                let config = fs::read_to_string(&file).unwrap();
-
-                let config: Config =
-                    serde_json::from_str(&config).expect("Unable to read config for default.");
-
-                args.field = config.field;
-                args.out = config.out;
-                args.vm = config.vm;
-            } else {
-                eprintln!("Missing fields.");
-
-                exit(1);
-            }
-        }
-
-        let ps = PsScriptBuilder::new()
-            .no_profile(true)
-            .non_interactive(true)
-            .hidden(true)
-            .print_commands(false)
-            .build();
-
-        let script = format!(
-            "(Get-VM -Name '{}').NetworkAdapters.IPAddresses[0]",
-            args.vm
-        );
-
-        let output = ps.run(&script).expect("Failed to run script");
-
-        let file = fs::read_to_string(&args.out).expect("File was unable to be read.");
-
-        let mut data: Value = serde_json::from_str(&file).expect("Unable to read JSON");
-
-        let new_val = json!(output.stdout().unwrap().trim());
-
-        match data {
-            Value::Object(ref mut map) => {
-                map.insert(args.field, new_val);
-            }
-            _ => {
-                eprintln!("Failed to match data to type. Unable to update field");
-                exit(1)
-            }
-        }
-
-        fs::write(
-            &args.out,
-            serde_json::to_string_pretty(&data).expect("Failed to serialize JSON"),
-        )
-        .expect("Failed to write to file");
+        eprintln!("Target JSON must be an object at the root");
+        exit(1);
     }
+}
+
+fn main() -> io::Result<()> {
+    let args = Args::parse();
+
+    // Determine config directory and file: ~/.hyperip/settings.json
+    let config_dir = home_dir()
+        .expect("Could not locate home directory")
+        .join(".hyperip");
+    let config_file = config_dir.join("settings.json");
+
+    // Ensure the config directory exists
+    fs::create_dir_all(&config_dir).expect("Failed to create configuration directory");
+
+    // If setting defaults, require all three args, then save and exit
+    if args.set_default {
+        let out = args.out.as_deref().unwrap_or_else(|| {
+            eprintln!("--out is required when using --set-default");
+            exit(1)
+        });
+        let field = args.field.as_deref().unwrap_or_else(|| {
+            eprintln!("--field is required when using --set-default");
+            exit(1)
+        });
+        let vm = args.vm.as_deref().unwrap_or_else(|| {
+            eprintln!("--vm is required when using --set-default");
+            exit(1)
+        });
+
+        let cfg = Config {
+            out: out.to_string(),
+            field: field.to_string(),
+            vm: vm.to_string(),
+        };
+        save_config(&config_file, &cfg);
+        println!("Defaults saved to {}", config_file.display());
+        return Ok(());
+    }
+
+    let defaults = if config_file.exists() {
+        Some(load_config(&config_file))
+    } else {
+        None
+    };
+
+    let out = args
+        .out
+        .or_else(|| defaults.as_ref().map(|c| c.out.clone()))
+        .unwrap_or_else(|| {
+            eprintln!("Output file must be specified or default set");
+            exit(1)
+        });
+
+    let field = args
+        .field
+        .or_else(|| defaults.as_ref().map(|c| c.field.clone()))
+        .unwrap_or_else(|| {
+            eprintln!("Field must be specified or default set");
+            exit(1)
+        });
+
+    let vm = args
+        .vm
+        .or_else(|| defaults.as_ref().map(|c| c.vm.clone()))
+        .unwrap_or_else(|| {
+            eprintln!("VM name must be specified or default set");
+            exit(1)
+        });
+
+    let target = expand_path(&out);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if !target.exists() {
+        fs::write(&target, "{}")?;
+    }
+
+    let ip = query_vm_ip(&vm);
+    update_json(&target, &field, json!(ip));
+
+    Ok(())
 }
