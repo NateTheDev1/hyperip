@@ -15,23 +15,6 @@
 - **PowerShell** available in `PATH`
 - **Rust toolchain** (for building from source)
 
-## Installation
-
-### Build from source
-
-```bash
-# Clone the repo
-git clone https://github.com/youruser/hyperip.git
-cd hyperip
-
-# Build and install globally (to ~/.cargo/bin)
-cargo install --path .
-```
-
-### Download a prebuilt binary
-
-Check the [Releases](https://github.com/youruser/hyperip/releases) page and grab the `.zip` or `.tar.gz` for your platform, then unpack and move `hyperip` (or `hyperip.exe`) into a folder on your `PATH`.
-
 ## Usage
 
 ```text
